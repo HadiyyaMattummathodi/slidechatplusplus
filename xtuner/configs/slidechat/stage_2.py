@@ -26,8 +26,7 @@ llm_name_or_path = 'Qwen/Qwen2.5-7B-Instruct'
 # Data
 data_path = 'slidechat_train_vqa_stage2.json'
 image_path_list = None
-pretrained_pth = 'stage1_pth'
-
+pretrained_pth = r'/home/ai-11/.cache/huggingface/hub/models--General-Medical-AI--SlideChat_Weight/snapshots/Model_Weights/stage1_pth/zero_pp_rank_0_mp_rank_00_model_states.pt'
 prompt_template = PROMPT_TEMPLATE.qwen_chat
 
 
@@ -54,7 +53,7 @@ save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 # Evaluate the generation performance during the training
 evaluation_freq = 1000
 SYSTEM = ''
-evaluation_images = './BLCA/TCGA-GV-A40G-01Z-00-DX1.csv'
+evaluation_images = r'/home/ai-11/Public/SlideChat Model/SlideChat/dataset/WSI_feat/TCGA-A7-A0CJ-01Z-00-DX2.csv'
 evaluation_inputs = ['Generate an overview summarizing the principal findings from the pathology examination of the whole slide image.']
 
 #######################################################################

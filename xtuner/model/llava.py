@@ -6,6 +6,7 @@ from collections import OrderedDict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from accelerate import init_empty_weights
 from mmengine import print_log
 from mmengine.config import Config, ConfigDict
@@ -27,7 +28,12 @@ from .utils import (LoadWoInit, find_all_linear_names,
                     prepare_inputs_labels_for_multimodal, traverse_dict)
 
 from .torchscale.model.LongNet import make_longnet_from_name
-import torch.nn.functional as F
+# import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# print(torch.cuda.is_available())
+# print(torch.cuda.get_device_name(0))
+
+print("[DEBUG] LLaVAModel is being imported from:", __file__, flush=True)
 
 def convert_state_dict_to_hf(state_dict, mapping):
     new_state_dict = {}
@@ -57,62 +63,106 @@ class LLaVAModel(BaseModel):
                  pretrained_pth=None,
                  projector_depth=2,
                  llm_lora=None,
+                 encoder_name= None,
                  visual_encoder_lora=None,
                  use_activation_checkpointing=True,
                  max_position_embeddings=None,
-                 hidden_size=512,
+                 hidden_size=512, # This is the WSI feature dim (C_visual)
                  train_stage='2',
-                 enable_long_net=True):
+                 enable_long_net=True,
+                 use_focus=False,
+                 vision_feature_dim=512): # This is the WSI feature dim
         super().__init__()
+
+        # --- FOCUS Token Compression Parameters ---
+        self.sim_threshold = 0.7
+        self.window_size = 32
+        self.L_max = 512
+        self.use_focus = use_focus
+        self.vision_feature_dim = vision_feature_dim # 512
         
+        # self.atok_proj will be defined later after self.llm is built
+
+        self.encoder_name = encoder_name
+        self.torch_dtype = torch.float16
+        self.to(torch.float16)
+        
+        # Determine initial LongNet freeze status
+        self.freeze_llm = freeze_llm
+        self.freeze_visual_encoder = True
+        self.freeze_long_net = True
+        
+        if train_stage == '1':
+            print('train_stage == 1')
+            self.freeze_llm = True
+            self.freeze_long_net = False # Freeze LLM, train LongNet/Projector
+        elif train_stage == '2':
+            print('train_stage == 2')
+            self.freeze_llm = False # Train LLM, LongNet, and Projector
+            self.freeze_long_net = False 
+
+        with LoadWoInit():
+            if isinstance(llm, dict):
+                llm = self._dispatch_lm_model_cfg(llm, max_position_embeddings)
+            self.llm = self._build_from_cfg_or_module(llm)
+        
+        # --- CRITICAL FIX 1: Define atok_proj after self.llm is built ---
+        # This projects visual features (512) to LLM hidden size (e.g., 3584)
+        self.llm_hidden_size = self.llm.config.hidden_size 
+        
+        if self.use_focus and self.vision_feature_dim != self.llm_hidden_size:
+            self.atok_proj = nn.Linear(
+                self.vision_feature_dim,
+                self.llm_hidden_size, 
+                bias=True
+            )
+        else:
+            # Use identity if FOCUS is disabled or dims already match
+            self.atok_proj = nn.Identity()
+        
+        # Ensure atok_proj is on the correct initial dtype
+        self.atok_proj.to(self.torch_dtype)
+
+
         self.enable_long_net = enable_long_net
         if enable_long_net:
             print('enable long net')
         else:
             print('disable long net')
-        self.freeze_llm = freeze_llm
-        self.freeze_visual_encoder = True
-        if train_stage == '1':
-            print('train_stage == 1')
-            self.freeze_llm = True
-            self.freeze_long_net = False
 
-        elif train_stage == '2':
-            print('train_stage == 2')
-            self.freeze_llm = False
-            self.freeze_long_net = False
-
-        with LoadWoInit():
-            if isinstance(llm, dict):
-                llm = self._dispatch_lm_model_cfg(llm, max_position_embeddings)
-
-            self.llm = self._build_from_cfg_or_module(llm)
-            
-
-        self.encoder_name = "LongNet_{}_layers_{}_dim".format(2, 512)
-        self.LongNet_encoder = make_longnet_from_name(self.encoder_name) # , drop_path_rate=0.3, dropout=0.3, segment_length=1024
+        # --- LongNet Setup ---
+        # 1. Initialize LongNet Encoder
+        self.LongNet_encoder = make_longnet_from_name(self.encoder_name).to(self.torch_dtype)
+        
+        # 2. Reduction layer: Map LongNet output (e.g., 1024) back to WSI input dim (512)
+        LONGNET_OUTPUT_DIM = hidden_size
+        self.longnet_reduce = nn.Linear(LONGNET_OUTPUT_DIM, hidden_size, bias=True).to(self.torch_dtype)
         
         self.llm.config.use_cache = False
         dispatch_modules(self.llm)
 
         self.projector_depth = projector_depth
-
+        
+        # --- Projector Setup ---
         projector_config = ProjectorConfig(
-            visual_hidden_size=hidden_size,
+            visual_hidden_size=hidden_size, # Input to projector is 512 (after LongNet+Reduction)
             llm_hidden_size=self.llm.config.hidden_size,
             depth=self.projector_depth)        
 
         self.projector = ProjectorModel(projector_config).to(
             self.llm.dtype)
         
-
+        # --- Freezing Layers ---
         if self.freeze_llm:
             print('freeze_llm')
             self.llm.requires_grad_(False)        
         if self.freeze_long_net:
             print('freeze_long_net')
             self.LongNet_encoder.requires_grad_(False)
+            self.longnet_reduce.requires_grad_(False)
         
+
+# File: xtuner/model/llava.py (around line 167-175 in your latest version)
 
         if use_activation_checkpointing:
             # For backward compatibility
@@ -122,11 +172,8 @@ class LLaVAModel(BaseModel):
                 self.llm.get_input_embeddings().register_forward_hook(
                     make_inputs_require_grad)
                 
-
             self.projector.enable_input_require_grads()
-            # self.LongNet_encoder.enable_input_require_grads()
-
-            # enable gradient (activation) checkpointing for memory efficiency
+            # self.atok_proj.enable_input_require_grads()  <-- REMOVE THIS LINE
             self.gradient_checkpointing_enable()
 
         self.use_llm_lora =  None
@@ -137,15 +184,12 @@ class LLaVAModel(BaseModel):
 
         if pretrained_pth is not None:
             pretrained_state_dict = guess_load_checkpoint(pretrained_pth)
-
             self.load_state_dict(pretrained_state_dict, strict=False)
             print_log(f'Load pretrained weight from {pretrained_pth}',
                       'current')
 
         self.visual_select_layer = visual_select_layer
-
         self._is_init = True
-
         self.is_first_iter = True
 
     def _parse_lora_config(self, lora_config):
@@ -179,7 +223,6 @@ class LLaVAModel(BaseModel):
 
     def activation_checkpointing_enable(self):
         self.llm.gradient_checkpointing_enable()
-        # self.visual_encoder.gradient_checkpointing_enable()
         self.projector.gradient_checkpointing_enable()
 
     def gradient_checkpointing_disable(self):
@@ -187,7 +230,6 @@ class LLaVAModel(BaseModel):
 
     def activation_checkpointing_disable(self):
         self.llm.gradient_checkpointing_disable()
-        # self.visual_encoder.gradient_checkpointing_disable()
         self.projector.gradient_checkpointing_disable()
 
     def init_weights(self):
@@ -196,16 +238,8 @@ class LLaVAModel(BaseModel):
     def state_dict(self, *args, **kwargs):
         state_dict = super().state_dict(*args, **kwargs)
         to_return = OrderedDict()
-        # Step 1. visual_encoder
-        if self.use_visual_encoder_lora:
-            to_return.update(
-                get_peft_model_state_dict(
-                    self.visual_encoder, state_dict=state_dict))
-        elif not self.freeze_visual_encoder:
-            to_return.update({
-                k: v
-                for k, v in state_dict.items() if 'visual_encoder.' in k
-            })
+        # Step 1. visual_encoder (omitted/not used)
+        
         # Step 2. LLM
         if self.use_llm_lora:
             to_return.update(
@@ -223,6 +257,16 @@ class LLaVAModel(BaseModel):
         to_return.update(
             {k: v
              for k, v in state_dict.items() if 'LongNet_encoder.' in k})
+        to_return.update(
+            {k: v
+             for k, v in state_dict.items() if 'longnet_reduce.' in k})
+        
+        # Step 5. atok_proj (for FOCUS)
+        if not isinstance(self.atok_proj, nn.Identity):
+             to_return.update(
+                {k: v
+                 for k, v in state_dict.items() if 'atok_proj.' in k})
+                 
         return to_return
 
     @staticmethod
@@ -246,7 +290,6 @@ class LLaVAModel(BaseModel):
                     'factor': scaling_factor
                 }
 
-        # hardcode for internlm2
         llm_cfg.attn_implementation = 'flash_attention_2'
         cfg.config = llm_cfg
 
@@ -269,8 +312,6 @@ class LLaVAModel(BaseModel):
             else torch.float16
 
         if getattr(cfg, 'attn_implementation', None) is not None:
-            # Flash Attention 2.0 only supports torch.float16 and
-            # torch.bfloat16 dtypes
             if cfg.attn_implementation == 'flash_attention_2':
                 cfg.torch_dtype = torch_dtype
         elif SUPPORT_FLASH2 and cls_name in SUPPORT_FLASH_ATTN2:
@@ -317,28 +358,125 @@ class LLaVAModel(BaseModel):
             return BUILDER.build(cfg_or_mod)
         else:
             raise NotImplementedError
-
+            
     def forward(self, data, data_samples=None, mode='loss'):
+        print(f"[DEBUG] Entered LLaVAModel.forward, mode={mode}", flush=True)
+        print(f"[DEBUG] forward() data keys: {list(data.keys())}", flush=True)
+
         if self.is_first_iter:
-            # hardcode for qlora DeepSpeed ZeRO3, put buffers and QuantState to
-            # device
-            # Only required in `LLaVAModel` .
-            # We do not need this in `SupervisedFinetune` .
             self.to(data['input_ids'].device)
             self.is_first_iter = False
-        
-        # data_dict['pixel_values']=[[pixel_values of img1], [pixel_values of img2], ...]
+
         if 'pixel_values' in data:
-            feat_to_proj = data['pixel_values'].to(self.llm.dtype) # torch.Size([1, img_num, 768])
+            x = data['pixel_values']
+            print("\n================ IMAGE INPUT DEBUG ================")
+            print(f"[pixel_values] shape: {tuple(x.shape)}")
+            print(f"[pixel_values] dtype:  {x.dtype}")
+            print(f"[pixel_values] device: {x.device}")
+            print("===================================================\n")
+
+        feat_to_proj = None
+
+        # -------------------------------
+        # FOCUS path (token compression)
+        # -------------------------------
+        if self.use_focus and 'pixel_values' in data:
+            # 1) Text features (for text-guided selection)
+            input_ids = data["input_ids"]
+            text_embeds = self.llm.get_input_embeddings()(input_ids)  # [B, L, H_llm]
+            text_features = text_embeds.mean(dim=1)  # [B, H_llm]
+
+            # 2) Raw visual tokens
+            feat_to_proj = data['pixel_values'].to(self.llm.dtype)  # [B, N, 512]
+            print(f"Step 3_feat_to_proj: {feat_to_proj.squeeze(0).shape}")
+
+            # 3) Adaptive token selection (global, text-guided)
+            selected_features, _ = self.adaptive_token_selection(
+                feat_to_proj.squeeze(0),      # [N, 512]
+                text_features.squeeze(0)      # [H_llm]
+            )
+            print(f"Step 3_selected_features: {selected_features.shape}")
+
+            # 4) Spatial token compression (local redundancy removal)
+            compressed_features = self.spatial_token_compression(
+                selected_features,
+                text_features.squeeze(0)
+            )
+
+            assert compressed_features.dim() == 2, \
+                f"compressed_features must be 2D [T, C], got {compressed_features.shape}"
+            assert compressed_features.size(1) == self.vision_feature_dim, \
+                f"Expected feature dim {self.vision_feature_dim}, got {compressed_features.size(1)}"
+
+            # 5) Pad / trim to fixed length T_expected = L_max
+            T_expected = self.L_max
+            T_cur = compressed_features.size(0)
+
+            if T_cur < T_expected:
+                pad_len = T_expected - T_cur
+                pad = torch.zeros(
+                    pad_len,
+                    compressed_features.size(1),
+                    device=compressed_features.device,
+                    dtype=compressed_features.dtype,
+                )
+                compressed_features = torch.cat([compressed_features, pad], dim=0)
+            elif T_cur > T_expected:
+                compressed_features = compressed_features[:T_expected]
+
+            # 6) Build batch-first features
+            feat_to_proj = compressed_features.unsqueeze(0)  # [1, T_expected, 512]
+
+            print("\n================ FOCUS DEBUG ================")
+            print(f"[FOCUS] feat_to_proj (batch first) shape: {tuple(feat_to_proj.shape)}")
+
+            # 7) LongNet expects [T, B, C]
+            feat_to_proj_longnet = feat_to_proj.permute(1, 0, 2).to(self.torch_dtype)  # [T, 1, 512]
+            print(f"[FOCUS] feat_to_proj for LongNet (seq first) shape: {tuple(feat_to_proj_longnet.shape)}")
+            print("=============================================\n")
+
+            # 8) Pass through LongNet encoder if enabled
             if self.enable_long_net:
-                long_net_output = self.LongNet_encoder(src_tokens=None, token_embeddings=feat_to_proj.permute(1, 0, 2))["encoder_out"] # shape: (576, img_num, 1024)
-                feat_to_proj = long_net_output.permute(1, 0, 2) # shape: [1, img_num, 768]
+                long_net_output = self.LongNet_encoder(
+                    src_tokens=None,
+                    token_embeddings=feat_to_proj_longnet
+                )["encoder_out"]  # [T, 1, 1024]
 
+                feat_to_proj = long_net_output.permute(1, 0, 2)  # [1, T, 1024]
+
+                # 🔥 Reduce 1024 → 512 before projector
+                feat_to_proj = self.longnet_reduce(feat_to_proj)  # [1, T, 512]
+
+                print(f"[FOCUS] after reduction feat_to_proj shape: {tuple(feat_to_proj.shape)}")
+
+        # -------------------------------
+        # Non-FOCUS path (original)
+        # -------------------------------
+        elif 'pixel_values' in data:
+            feat_to_proj = data['pixel_values'].to(self.llm.dtype)  # [B, N, 512]
+            if self.enable_long_net:
+                long_net_output = self.LongNet_encoder(
+                    src_tokens=None,
+                    token_embeddings=feat_to_proj.permute(1, 0, 2).to(self.torch_dtype)
+                )["encoder_out"]  # [T, B, 1024]
+                
+                feat_to_proj = long_net_output.permute(1, 0, 2)  # [B, T, 1024]
+                
+                # Apply reduction for the non-FOCUS path as well
+                feat_to_proj = self.longnet_reduce(feat_to_proj) # [B, T, 512]
+
+
+        # -------------------------------
+        # Project visual tokens & prepare multimodal inputs
+        # -------------------------------
+        if 'pixel_values' in data:
             pixel_values = self.projector(feat_to_proj.to(self.llm.dtype))
-
-            data['pixel_values'] = pixel_values # shape: [1, 576, 4096]
+            data['pixel_values'] = pixel_values
             data = prepare_inputs_labels_for_multimodal(llm=self.llm, **data)
 
+        # -------------------------------
+        # LLaVA forward modes
+        # -------------------------------
         if mode == 'loss':
             return self.compute_loss(data, data_samples)
         elif mode == 'predict':
@@ -349,9 +487,7 @@ class LLaVAModel(BaseModel):
             raise NotImplementedError
 
     def _forward(self, data, data_samples=None):
-
         outputs = self.llm(**data)
-
         return outputs
 
     def predict(self, data, data_samples=None):
@@ -369,6 +505,112 @@ class LLaVAModel(BaseModel):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self.llm, name)
+        
+    def encode_image(self, image: torch.Tensor, input_ids: torch.Tensor = None):
+
+        """
+        Encode WSI features into pixel_values, optionally with FOCUS.
+        Args:
+            image: [B, N, 512] WSI patch features
+            input_ids: [B, L] text tokens
+        Returns:
+            pixel_values: [B, T, hidden_size] visual tokens for the LLM
+        """
+
+        print("\n================ ENCODE_IMAGE DEBUG ================", flush=True)
+        print(f"[ENC] raw image (WSI features) shape: {tuple(image.shape)}", flush=True)
+
+        B, N, C = image.shape
+        assert C == self.vision_feature_dim, f"Expected image feat dim {self.vision_feature_dim}, got {C}"
+
+        # -------------------------------------------------
+        # A) FOCUS path
+        # -------------------------------------------------
+        if self.use_focus and input_ids is not None:
+            # 1) Text features (for text-guided selection)
+            text_embeds = self.llm.get_input_embeddings()(input_ids)    # [B, L, H_llm]
+            text_features = text_embeds.mean(dim=1)                     # [B, H_llm]
+
+            # 2) Start from WSI tokens
+            feat_to_proj = image.to(self.llm.dtype)                     # [B, N, 512]
+            assert B == 1, "Current FOCUS implementation assumes batch size = 1"
+
+            # 3) Adaptive token selection
+            selected_features, _ = self.adaptive_token_selection(
+                feat_to_proj.squeeze(0),          # [N, 512]
+                text_features.squeeze(0)          # [H_llm]
+            )
+            print(f"[FOCUS] selected_features shape: {tuple(selected_features.shape)}",
+                  flush=True)
+
+            # 4) Spatial token compression
+            compressed_features = self.spatial_token_compression(
+                selected_features,
+                text_features.squeeze(0)          # [H_llm]
+            )                                     # [T', 512]
+            print(f"[FOCUS] compressed_features shape: {tuple(compressed_features.shape)}",
+                  flush=True)
+
+            # 5) Pad / trim to L_max
+            T_expected = self.L_max
+            T_cur = compressed_features.size(0)
+
+            if T_cur < T_expected:
+                pad_len = T_expected - T_cur
+                pad = torch.zeros(
+                    pad_len,
+                    compressed_features.size(1),
+                    device=compressed_features.device,
+                    dtype=compressed_features.dtype,
+                )
+                compressed_features = torch.cat([compressed_features, pad], dim=0)
+            elif T_cur > T_expected:
+                compressed_features = compressed_features[:T_expected]
+
+            # 6) Batch-first before LongNet
+            feat_to_proj = compressed_features.unsqueeze(0)             # [1, T_expected, 512]
+
+        else:
+            # -------------------------------------------------
+            # B) Non-FOCUS path (original SlideChat)
+            # -------------------------------------------------
+            feat_to_proj = image.to(self.llm.dtype)                     # [B, N, 512]
+            T_expected = feat_to_proj.size(1)
+
+        # -------------------------------------------------
+        # LongNet expects [T, B, C]
+        token_embeddings = feat_to_proj.permute(1, 0, 2)                # [T, B, 512]
+        print(f"[ENC] token_embeddings (LongNet INPUT after FOCUS/WSI) shape: "
+              f"{tuple(token_embeddings.shape)}", flush=True)
+
+        # -------------------------------------------------
+        # C) LongNet + projector (common to both paths)
+        # -------------------------------------------------
+        if self.enable_long_net:
+              long_out = self.LongNet_encoder(
+                  src_tokens=None,
+                  token_embeddings=token_embeddings.to(self.torch_dtype)
+              )["encoder_out"]  # [T, B, 1024]
+                
+              feat_to_proj = long_out.permute(1, 0, 2)  # [B, T, 1024]
+              print(f"LongNet output shape: {feat_to_proj.shape}")
+
+              # 🔥 Reduce LongNet output dim → 512
+              feat_to_proj = self.longnet_reduce(feat_to_proj)  # [B, T, 512]
+
+              print(f"[ENC] after reduction feat_to_proj shape: "
+                    f"{tuple(feat_to_proj.shape)}", flush=True)
+
+        else:
+            print("[ENC] LongNet disabled, skipping LongNet_encoder", flush=True)
+
+        pixel_values = self.projector(feat_to_proj.to(self.llm.dtype))  # [B, T, hidden_size]
+        print(f"[ENC] pixel_values shape (after projector): "
+              f"{tuple(pixel_values.shape)}", flush=True)
+        print("====================================================\n", flush=True)
+
+        return pixel_values
+
 
     def to_hf(self,
               cfg,
@@ -386,6 +628,8 @@ class LLaVAModel(BaseModel):
             self.to_official_llava(cfg, save_dir, fp32, save_pretrained_kwargs)
         else:
             raise NotImplementedError
+        
+    
 
     def to_xtuner_llava(self,
                         cfg,
@@ -410,27 +654,6 @@ class LLaVAModel(BaseModel):
             self.llm.save_pretrained(llm_path, **save_pretrained_kwargs)
         self.llm.config.use_cache = False
 
-        # Visual Encoder
-        if self.use_visual_encoder_lora:
-            visual_encoder_path = osp.join(save_dir, 'visual_encoder_adapter')
-            print_log(
-                f'Saving visual_encoder adapter to {visual_encoder_path}',
-                'current')
-            self.visual_encoder.save_pretrained(visual_encoder_path,
-                                                **save_pretrained_kwargs)
-        elif not self.freeze_visual_encoder:
-            visual_encoder_path = osp.join(save_dir, 'visual_encoder')
-            print_log(
-                'Saving visual_encoder image_processor to'
-                f'{visual_encoder_path}', 'current')
-            image_processor = BUILDER.build(cfg.image_processor)
-            image_processor.save_pretrained(visual_encoder_path,
-                                            **save_pretrained_kwargs)
-            print_log(f'Saving visual_encoder to {visual_encoder_path}',
-                      'current')
-            self.visual_encoder.save_pretrained(visual_encoder_path,
-                                                **save_pretrained_kwargs)
-
         # Projector
         projector_path = osp.join(save_dir, 'projector')
         print_log(f'Saving projector to {projector_path}', 'current')
@@ -442,6 +665,18 @@ class LLaVAModel(BaseModel):
         print_log(f'Saving LongNet_encoder to {LongNet_encoder_path}', 'current')
         self.LongNet_encoder.save_pretrained(LongNet_encoder_path,
                                        **save_pretrained_kwargs)
+        
+        # LongNet Reduce
+        longnet_reduce_path = osp.join(save_dir, 'longnet_reduce')
+        print_log(f'Saving longnet_reduce to {longnet_reduce_path}', 'current')
+        torch.save(self.longnet_reduce.state_dict(), osp.join(longnet_reduce_path, 'pytorch_model.bin'))
+        
+        # atok_proj
+        if not isinstance(self.atok_proj, nn.Identity):
+            atok_proj_path = osp.join(save_dir, 'atok_proj')
+            print_log(f'Saving atok_proj to {atok_proj_path}', 'current')
+            torch.save(self.atok_proj.state_dict(), osp.join(atok_proj_path, 'pytorch_model.bin'))
+
 
     def to_huggingface_llava(self,
                              cfg,
@@ -465,6 +700,15 @@ class LLaVAModel(BaseModel):
             'layers.1': 'LongNet_encoder.layers.1',
             'layer_norm': 'LongNet_encoder.layer_norm'
         }
+        LONGNET_REDUCE_MAPPING = {
+            'weight': 'longnet_reduce.weight',
+            'bias': 'longnet_reduce.bias'
+        }
+        ATOK_PROJ_MAPPING = {
+            'weight': 'atok_proj.weight',
+            'bias': 'atok_proj.bias'
+        }
+
 
         assert getattr(self.llm, 'hf_quantizer', None) is None, \
             'This conversion format does not support quantized LLM.'
@@ -483,19 +727,7 @@ class LLaVAModel(BaseModel):
         llm_state_dict = llm.state_dict()
         llm_state_dict = convert_state_dict_to_hf(llm_state_dict, LLM_MAPPING)
 
-        need_visual_encoder = (not self.freeze_visual_encoder
-                               or self.use_visual_encoder_lora)
-        visual_encoder = self.visual_encoder
-        if self.use_visual_encoder_lora:
-            visual_encoder = self.visual_encoder.merge_and_unload()
-        assert isinstance(visual_encoder, CLIPVisionModel),\
-            'This conversion format only supports CLIPVisionModel.'
-        if need_visual_encoder:
-            visual_encoder_state_dict = visual_encoder.state_dict()
-            visual_encoder_state_dict = convert_state_dict_to_hf(
-                visual_encoder_state_dict, VIT_MAPPING)
-        else:
-            visual_encoder_state_dict = {}
+        visual_encoder_state_dict = {}
 
         projector_state_dict = self.projector.state_dict()
         projector_state_dict = convert_state_dict_to_hf(
@@ -504,17 +736,34 @@ class LLaVAModel(BaseModel):
         LongNet_encoder_state_dict = self.LongNet_encoder.state_dict()
         LongNet_encoder_state_dict = convert_state_dict_to_hf(
             LongNet_encoder_state_dict, LONGNET_MAPPING)
+            
+        longnet_reduce_state_dict = self.longnet_reduce.state_dict()
+        longnet_reduce_state_dict = convert_state_dict_to_hf(
+            longnet_reduce_state_dict, LONGNET_REDUCE_MAPPING)
+            
+        atok_proj_state_dict = {}
+        if not isinstance(self.atok_proj, nn.Identity):
+             atok_proj_state_dict = self.atok_proj.state_dict()
+             atok_proj_state_dict = convert_state_dict_to_hf(
+                atok_proj_state_dict, ATOK_PROJ_MAPPING)
+
 
         state_dict = {
             **projector_state_dict,
             **llm_state_dict,
             **visual_encoder_state_dict,
-            **LongNet_encoder_state_dict
+            **LongNet_encoder_state_dict,
+            **longnet_reduce_state_dict,
+            **atok_proj_state_dict
         }
 
         # init model
         text_config = llm.config
-        vision_config = visual_encoder.config
+        
+        vision_config = AutoConfig.from_pretrained(
+            'openai/clip-vit-large-patch14', trust_remote_code=True)
+
+
         config = LlavaConfig(
             text_config=text_config,
             vision_config=vision_config,
@@ -605,6 +854,15 @@ class LLaVAModel(BaseModel):
             'layers.1': 'LongNet_encoder.layers.1',
             'layer_norm': 'LongNet_encoder.layer_norm'
         }
+        LONGNET_REDUCE_MAPPING = {
+            'weight': 'longnet_reduce.weight',
+            'bias': 'longnet_reduce.bias'
+        }
+        ATOK_PROJ_MAPPING = {
+            'weight': 'atok_proj.weight',
+            'bias': 'atok_proj.bias'
+        }
+
 
         try:
             from llava.model import LlavaConfig, LlavaLlamaForCausalLM
@@ -630,19 +888,7 @@ class LLaVAModel(BaseModel):
             'This conversion format only supports LlamaForCausalLM.'
         llm_state_dict = llm.state_dict()
 
-        need_visual_encoder = (not self.freeze_visual_encoder
-                               or self.use_visual_encoder_lora)
-        visual_encoder = self.visual_encoder
-        if self.use_visual_encoder_lora:
-            visual_encoder = self.visual_encoder.merge_and_unload()
-        assert isinstance(visual_encoder, CLIPVisionModel),\
-            'This conversion format only supports CLIPVisionModel.'
-        if need_visual_encoder:
-            visual_encoder_state_dict = visual_encoder.state_dict()
-            visual_encoder_state_dict = convert_state_dict_to_hf(
-                visual_encoder_state_dict, VIT_MAPPING)
-        else:
-            visual_encoder_state_dict = {}
+        visual_encoder_state_dict = {}
 
         projector_state_dict = self.projector.state_dict()
         projector_state_dict = convert_state_dict_to_hf(
@@ -651,12 +897,25 @@ class LLaVAModel(BaseModel):
         LongNet_encoder_state_dict = self.LongNet_encoder.state_dict()
         LongNet_encoder_state_dict = convert_state_dict_to_hf(
             LongNet_encoder_state_dict, LONGNET_MAPPING)
+            
+        longnet_reduce_state_dict = self.longnet_reduce.state_dict()
+        longnet_reduce_state_dict = convert_state_dict_to_hf(
+            longnet_reduce_state_dict, LONGNET_REDUCE_MAPPING)
+
+        atok_proj_state_dict = {}
+        if not isinstance(self.atok_proj, nn.Identity):
+             atok_proj_state_dict = self.atok_proj.state_dict()
+             atok_proj_state_dict = convert_state_dict_to_hf(
+                atok_proj_state_dict, ATOK_PROJ_MAPPING)
+
 
         state_dict = {
             **projector_state_dict,
             **llm_state_dict,
             **visual_encoder_state_dict,
-            **LongNet_encoder_state_dict
+            **LongNet_encoder_state_dict,
+            **longnet_reduce_state_dict,
+            **atok_proj_state_dict
         }
 
         # init model
@@ -665,17 +924,21 @@ class LLaVAModel(BaseModel):
         assert isinstance(image_processor, CLIPImageProcessor),\
             'This conversion format only supports CLIPImageProcessor.'
 
+        vision_config = AutoConfig.from_pretrained(
+            'openai/clip-vit-large-patch14', trust_remote_code=True)
+
+
         llava_config_dict = llm.config.__dict__.copy()
         llava_config_dict.update(
             dict(
                 image_aspect_ratio='pad',
-                mm_hidden_size=visual_encoder.config.hidden_size,
+                mm_hidden_size=vision_config.hidden_size,
                 mm_projector_type=f'mlp{self.projector_depth}x_gelu',
                 mm_use_im_patch_token=False,
                 mm_use_im_start_end=False,
                 mm_vision_select_feature='patch',
                 mm_vision_select_layer=self.visual_select_layer,
-                mm_vision_tower=visual_encoder.config.name_or_path,
+                mm_vision_tower=vision_config.name_or_path,
                 unfreeze_mm_vision_tower=need_visual_encoder,
                 model_type='llava',
                 use_cache=True,
@@ -697,3 +960,124 @@ class LLaVAModel(BaseModel):
         model.save_pretrained(save_dir, **save_pretrained_kwargs)
         image_processor.save_pretrained(save_dir, **save_pretrained_kwargs)
         tokenizer.save_pretrained(save_dir, **save_pretrained_kwargs)
+
+
+
+# FOCUS Redundancy Reduction Injection 
+
+
+    def compute_patch_similarity(self, x, window_size):
+        """Compute similarity between patches within sliding windows"""
+        N, D = x.shape
+        x_norm = F.normalize(x, p=2, dim=-1)
+        
+        similarities = []
+        selected_indices = []
+        
+        for i in range(0, N, window_size):
+            window = x_norm[i:i+window_size]
+            
+            # Skip if window is too small
+            if len(window) < 2:
+                selected_indices.append(torch.arange(i, min(i+window_size, N), device=x.device))
+                continue
+                
+            # Local similarity computation
+            window_sim = torch.mm(window, window.t())
+            
+            # Adaptive thresholding
+            if window_sim.numel() > 1:
+                threshold = window_sim.mean() + window_sim.std(unbiased=False)
+            else:
+                threshold = window_sim.mean()
+            
+            # Select non-redundant patches
+            redundant = window_sim.mean(1) > threshold
+            keep_indices = torch.where(~redundant)[0] + i
+            
+            if len(keep_indices) == 0:
+                keep_indices = torch.tensor([i], device=x.device)
+                
+            selected_indices.append(keep_indices)
+            similarities.append(window_sim)
+        
+        if not selected_indices:
+            return [], torch.arange(N, device=x.device)
+            
+        return similarities, torch.cat(selected_indices)
+
+
+    def adaptive_token_selection(self, features, text_features):
+        """Select tokens based on text relevance and local structure"""
+        N, D = features.shape
+
+        # 1) Compute local similarities & initial indices
+        similarities, indices = self.compute_patch_similarity(features, self.window_size)
+
+        # 2) Use a common dtype/device (match the LLM)
+        common_dtype = getattr(self.llm, "dtype", features.dtype)
+        device = features.device
+        features = features.to(device=device, dtype=common_dtype)
+        text_features = text_features.to(device=device, dtype=common_dtype)
+
+        # 3) Project to text dim if needed
+        # features.shape[-1] (512) vs text_features.shape[-1] (e.g., 3584)
+        if features.shape[-1] != text_features.shape[-1]:
+            # Use the pre-defined self.atok_proj, ensure device/dtype match
+            self.atok_proj.to(device=device, dtype=common_dtype)
+            features_projected = self.atok_proj(features) # [N, 512] -> [N, H_llm]
+        else:
+            features_projected = features
+
+        # 4) Text-guided importance: [N, H_llm] * [H_llm] -> [N, H_llm] -> sum(dim=-1) -> [N]
+        # FIX APPLIED: Dimensions now match: (N, H_llm) * (H_llm) is fine due to broadcasting and the sum
+        text_relevance = (features_projected * text_features).sum(dim=-1)
+
+        # 5) Build importance mask & pick top tokens
+        importance_mask = torch.zeros(N, device=device, dtype=common_dtype)
+        importance_mask[indices] = text_relevance[indices]
+
+        num_tokens = min(self.L_max, N)
+        _, selected_indices = torch.topk(importance_mask, k=num_tokens)
+        selected_indices, _ = torch.sort(selected_indices)
+
+        selected_features = features[selected_indices]
+        return selected_features, selected_indices
+
+
+    def spatial_token_compression(self, features, text_features):
+        """Compress tokens while preserving important information"""
+        N, D = features.shape
+        
+        chunk_size = 8
+        compressed_chunks = []
+        
+        for i in range(0, N, chunk_size):
+            chunk = features[i:i+chunk_size]
+            if len(chunk) == 1:
+                compressed_chunks.append(chunk)
+                continue
+                
+            # Compute chunk similarities
+            chunk_norm = F.normalize(chunk, p=2, dim=-1)
+            sim = F.cosine_similarity(
+                chunk_norm[:-1],
+                chunk_norm[1:],
+                dim=-1
+            )
+            
+            # Keep first token and dissimilar tokens
+            keep_mask = sim < self.sim_threshold
+            kept_tokens = torch.cat([
+                chunk[:1],
+                chunk[1:][keep_mask]
+            ])
+            compressed_chunks.append(kept_tokens)
+        
+        compressed_features = torch.cat(compressed_chunks)
+        
+        # Ensure we don't exceed max length
+        if len(compressed_features) > self.L_max:
+            compressed_features = compressed_features[:self.L_max]
+            
+        return compressed_features

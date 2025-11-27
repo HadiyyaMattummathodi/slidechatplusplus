@@ -1,4 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import time
+
+
 import argparse
 import os
 import os.path as osp
@@ -25,8 +28,13 @@ from PIL import Image
 import pandas as pd
 import numpy as np
 from transformers import GenerationConfig, StoppingCriteriaList
-
+from xtuner.model.llava import LLaVAModel
 import os
+
+
+import xtuner.model.llava as ll
+print("[DEBUG] test.py is using llava from:", ll.__file__, flush=True)
+
 
 TORCH_DTYPE_MAP = dict(
     fp16=torch.float16, bf16=torch.bfloat16, fp32=torch.float32, auto='auto')
@@ -107,20 +115,54 @@ def main():
     if args.work_dir is not None:
         # update configs according to CLI args if args.work_dir is not None
         cfg.work_dir = args.work_dir
-    elif cfg.get('work_dir', None) is None:
+    #el
+    if cfg.get('work_dir', None) is None:
         # use config filename as default work_dir if cfg.work_dir is None
         cfg.work_dir = osp.join('./work_dirs',
                                 osp.splitext(osp.basename(args.config))[0])
 
+    # # build the runner from config
+    # if 'runner_type' not in cfg:
+    #     # build the default runner
+    #     runner = Runner.from_cfg(cfg)
+    # else:
+    #     # build customized runner from the registry
+    #     # if 'runner_type' is set in the cfg
+    #     runner = RUNNERS.build(cfg)
+    # tokenizer = runner.model.tokenizer
+    # tokenizer.add_special_tokens({"additional_special_tokens": ["<image>"]})
+    # IMAGE_TOKEN_INDEX = tokenizer.convert_tokens_to_ids("<image>")
+    # print("IMAGE_TOKEN_INDEX =", IMAGE_TOKEN_INDEX)
+    
+
     # build the runner from config
     if 'runner_type' not in cfg:
-        # build the default runner
-        runner = Runner.from_cfg(cfg)
+          runner = Runner.from_cfg(cfg)
     else:
-        # build customized runner from the registry
-        # if 'runner_type' is set in the cfg
-        runner = RUNNERS.build(cfg)
-    
+         runner = RUNNERS.build(cfg)
+
+# ---------------------------------------------------------
+# FIX: Load correct tokenizer for the LLM
+# ---------------------------------------------------------
+    llm_name_or_path = runner.model.llm.config._name_or_path
+    print("[DEBUG] Loading tokenizer from:", llm_name_or_path)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+       llm_name_or_path,
+       trust_remote_code=True,
+       encode_special_tokens=True
+)
+
+# Add <image> to vocabulary
+    tokenizer.add_special_tokens({"additional_special_tokens": ["<image>"]})
+    IMAGE_TOKEN_INDEX = tokenizer.convert_tokens_to_ids("<image>")
+    print("[DEBUG] IMAGE_TOKEN_INDEX =", IMAGE_TOKEN_INDEX)
+
+# Resize embeddings in LLM to match tokenizer vocab
+    runner.model.llm.resize_token_embeddings(len(tokenizer))
+# ---------------------------------------------------------
+
+
     model_kwargs = {
     'trust_remote_code': True,
     'torch_dtype': TORCH_DTYPE_MAP[args.torch_dtype]
@@ -134,25 +176,44 @@ def main():
     runner.logger.info(f'Load checkpoint from {args.checkpoint}')
 
 
-    llm_name_or_path = 'Qwen/Qwen2.5-7B-Instruct'
-    tokenizer = AutoTokenizer.from_pretrained(
-                llm_name_or_path,
-                trust_remote_code=True,
-                encode_special_tokens=True)
+    # llm_name_or_path = 'Qwen/Qwen2.5-7B-Instruct'
+    # tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    # ADD THE SPECIAL <image> TOKEN TO THE VOCABULARY
+    # tokenizer.add_special_tokens({"additional_special_tokens": ["<image>"]})
+    # IMAGE_TOKEN_INDEX = tokenizer.convert_tokens_to_ids("<image>")
+    # print("IMAGE_TOKEN_INDEX =", IMAGE_TOKEN_INDEX)
+   # Resize model embeddings so the LLM knows about the new token
+    # runner.model.llm.resize_token_embeddings(len(tokenizer))
+
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #             llm_name_or_path,
+    #             trust_remote_code=True,
+    #             encode_special_tokens=True)
 
     llm = runner.model.llm
     llm.eval()
 
-    LongNet_encoder = runner.model.LongNet_encoder.to(model_kwargs['torch_dtype'])
-    LongNet_encoder.cuda()
-    LongNet_encoder.eval()    
+        
 
-    projector = runner.model.projector.to(model_kwargs['torch_dtype'])
-    projector.cuda()
-    projector.eval()
+# i chaged it to float16
+    # LongNet_encoder = runner.model.LongNet_encoder.to(torch.float16)
+    # LongNet_encoder.cuda()
+    # LongNet_encoder.eval()   
+
+
+    # projector = runner.model.projector.to(torch.float16)
+    # projector.cuda()
+    # projector.eval()
+
 
 
     df_test_case = pd.read_csv(args.test_slide_csv)
+    print("Columns in CSV:", df_test_case.columns.tolist())
+    
+    #Added by Khadija to fix the loading column name 
+    df_test_case.columns = df_test_case.columns.str.strip()  # remove whitespace
+    print(df_test_case.columns)  # check exact column names
+   
 
     df_test_case['Output'] = df_test_case.apply(lambda x: '', axis=1)
     columns = ['ID','Slide','Tumor','Broad Category','Narrow Category','Question','A','B','C','D','Answer','Output']
@@ -161,14 +222,25 @@ def main():
     for i in range(df_test_case.shape[0]):
         
         print('*'*30)
+
+        #Timestamp
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         print('id: ', i)
         case_name = df_test_case.loc[i, 'Slide']
-        test_image_file = "TCGA_patch_feat/" + df_test_case.loc[i, 'Tumor'] + "/" + case_name + ".csv"
+
+        #Inference
+        test_image_file = r"/home/ai-11/Public/SlideChat Model/SlideChat/dataset/WSI_feat/TCGA-A7-A0CJ-01Z-00-DX2.csv"
+        
+
+        #test_image_file = "/home/ai-11/Public/SlideChat Model/SlideChat/dataset/WSI_feat/TCGA_patch_feat/" + df_test_case.loc[i, 'Tumor'] + "/" + case_name + ".csv"
         if test_image_file.endswith('.csv'):
             image = pd.read_csv(test_image_file)
             image = image.iloc[:, :512]
             total_rows = image.shape[0]
-            sample_num = 38400
+            #sample_num = 38400
+            sample_num = 1024
             if total_rows >= sample_num:
                 indices = np.linspace(0, total_rows - 1, sample_num, dtype=int)
                 sampled_df = image.iloc[indices]
@@ -208,17 +280,35 @@ def main():
             input_ids.extend(cur_chunk_encode)
             if idx != len(chunk_encode) - 1:
                 input_ids.append(IMAGE_TOKEN_INDEX)
-        input_ids = torch.tensor(input_ids).cuda()
+        #input_ids = torch.tensor(input_ids).cuda()
+        input_ids.append(tokenizer.convert_tokens_to_ids("<image>"))
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        input_ids = torch.tensor(input_ids, device=device)
 
 
-        image = runner.model.LongNet_encoder(src_tokens=None, token_embeddings=image.permute(1, 0, 2).to(runner.model.llm.dtype))["encoder_out"]
-        image = image.permute(1, 0, 2)
+        # image = runner.model.LongNet_encoder(src_tokens=None, token_embeddings=image.permute(1, 0, 2).to(runner.model.llm.dtype))["encoder_out"]
+        # image = image.permute(1, 0, 2)
 
-        pixel_values = runner.model.projector(image)
+        
+        # pixel_values = runner.model.encode_image(image)
+        # mm_inputs = prepare_inputs_labels_for_multimodal(
+        #     llm=runner.model.llm,
+        #     input_ids=input_ids.unsqueeze(0),
+        #     pixel_values=pixel_values)
+        
+
+        #explicitly including focus redundancy removal while intiating input 
+       # Use LLaVAModel's encode_image, which includes FOCUS + LongNet + projector
+        pixel_values = runner.model.encode_image(
+            image,                          # [1, N, 512] WSI features
+            input_ids=input_ids.unsqueeze(0)  # [1, L] text for FOCUS
+        )
+
         mm_inputs = prepare_inputs_labels_for_multimodal(
             llm=runner.model.llm,
             input_ids=input_ids.unsqueeze(0),
             pixel_values=pixel_values)
+
 
         max_new_tokens=500
         gen_config = GenerationConfig(
@@ -234,6 +324,10 @@ def main():
         for word in stop_words:
             stop_criteria.append(
                 StopWordStoppingCriteria(tokenizer, word))
+        
+        #Timestamp
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t_gen0 = time.perf_counter()
 
         generate_output = llm.generate(
             **mm_inputs,
@@ -241,11 +335,22 @@ def main():
             streamer=None,
             bos_token_id=tokenizer.bos_token_id,
             stopping_criteria=stop_criteria)
+        
+        #Timestamp
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t_gen1 = time.perf_counter()
 
         generation_output = tokenizer.decode(generate_output[0])
         if generation_output.endswith('<|im_end|>'):
             generation_output = generation_output[:-10]
             
+        # Timestamp
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        print(f"Generation time: {(t_gen1 - t_gen0):.2f}s |  Total case time: {(t1 - t0):.2f}s")
+
+       
+       
         print('Output: ', generation_output)
 
         add_row = {

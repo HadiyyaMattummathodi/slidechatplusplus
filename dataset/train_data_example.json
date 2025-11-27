@@ -2,12 +2,12 @@
     {
         "id": "train::0",
         "image": [
-            "TCGA-A7-A0CJ-01Z-00-DX2.csv"
+            "/home/ai-11/Public/SlideChat Model/SlideChat/dataset/WSI_feat/TCGA-A7-A0CJ-01Z-00-DX2.csv"
         ],
         "conversations": [
             {
                 "from": "human",
-                "value": "How does the presence of vascular invasion in breast cancer patients influence prognosis in this case?\n<image>"
+                "value": "How does the presence of vascular invasion in breast cancer patients influence prognosis in this case?"
             },
             {
                 "from": "gpt",
@@ -18,12 +18,12 @@
     {
         "id": "train::1",
         "image": [
-            "TCGA-AR-A255-01Z-00-DX1.csv"
+            "/home/ai-11/Public/SlideChat Model/SlideChat/dataset/WSI_feat/TCGA-AR-A255-01Z-00-DX1.csv"
         ],
         "conversations": [
             {
                 "from": "human",
-                "value": "What type of carcinoma is indicated in this case based on histological examination and clinical context?\n<image>"
+                "value": "What type of carcinoma is indicated in this case based on histological examination and clinical context?"
             },
             {
                 "from": "gpt",
@@ -34,12 +34,12 @@
     {
         "id": "train::2",
         "image": [
-            "TCGA-A7-A6VV-01Z-00-DX2.csv"
+            "/home/ai-11/Public/SlideChat Model/SlideChat/dataset/WSI_feat/TCGA-A7-A6VV-01Z-00-DX2.csv"
         ],
         "conversations": [
             {
                 "from": "human",
-                "value": "What histopathological changes were observed in the non-tumorous breast tissue?\n<image>"
+                "value": "What histopathological changes were observed in the non-tumorous breast tissue?"
             },
             {
                 "from": "gpt",

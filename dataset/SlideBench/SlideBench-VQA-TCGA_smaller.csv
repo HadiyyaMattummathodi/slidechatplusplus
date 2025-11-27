@@ -1,0 +1,2 @@
+ID,Slide,Tumor,Broad Category,Narrow Category,Question,A,B,C,D,Answer
+1,TCGA-05-4244-01Z-00-DX1,LUAD,Diagnosis,Disease Classification,"Based on the histological features observed in the provided whole slide image and the accompanying clinical information,which of the following conditions is most likely present?",Squamous cell carcinoma,Small cell lung carcinoma,Papillary adenocarcinoma,Alveolar adenoma,C

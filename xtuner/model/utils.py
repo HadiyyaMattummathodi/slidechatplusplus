@@ -2,7 +2,9 @@
 import os.path as osp
 from typing import List, Optional
 
+import os 
 import torch
+import mmengine
 from mmengine.utils.misc import get_object_from_string
 from peft import PeftType
 from torch import nn
@@ -315,3 +317,27 @@ def guess_load_checkpoint(pth_model):
     else:
         raise FileNotFoundError(f'Cannot find {pth_model}')
     return state_dict
+    
+
+
+# def guess_load_checkpoint(checkpoint_path, pth_model=None):
+#     import os
+#     import torch
+#     import mmengine
+
+#     # Safe loading for trusted checkpoints
+#     if os.getenv("TRUST_MMENGINE_CHECKPOINT") == "1":
+#         with torch.serialization.safe_globals([mmengine.config.config.ConfigDict]):
+#             checkpoint = torch.load(checkpoint_path, map_location='cuda', weights_only=False)
+#     else:
+#         checkpoint = torch.load(checkpoint_path, map_location='cuda', weights_only=False)
+
+#     # Load into model if provided
+#     if pth_model is not None:
+#         pth_model.load_state_dict(checkpoint)
+#         pth_model.to('cuda')
+
+#     return checkpoint
+
+
+

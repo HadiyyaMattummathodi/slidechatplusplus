@@ -95,7 +95,7 @@ class MultiheadAttention(nn.Module):
             attn = torch.bmm(attn_probs, v)
             attn = rearrange(attn, '(b h) l d -> b l (h d)', h=self.num_heads)
         else:
-            assert flash_attn_func is not None
+            #assert flash_attn_func is not None
             assert rel_pos is None
             q = rearrange(q, '(b h) l d -> b l h d', h=self.num_heads)
             k = rearrange(k, '(b h) l d -> b l h d', h=self.num_heads)

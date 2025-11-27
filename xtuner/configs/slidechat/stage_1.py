@@ -53,7 +53,7 @@ save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 # Evaluate the generation performance during the training
 evaluation_freq = 1000
 SYSTEM = ''
-evaluation_images = './BLCA/TCGA-GV-A40G-01Z-00-DX1.csv'
+evaluation_images = r'/home/ai-11/Public/SlideChat Model/SlideChat/dataset/WSI_feat/TCGA-A7-A0CJ-01Z-00-DX2.csv'
 evaluation_inputs = ['Generate an overview summarizing the principal findings from the pathology examination of the whole slide image.']
 
 #######################################################################
